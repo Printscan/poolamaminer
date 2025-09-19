@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/h-manifest.conf"
 LOG_FILE="${CUSTOM_LOG_BASENAME}.log"
 VERSION_VALUE="${CUSTOM_VERSION:-}"
 ALGO_VALUE="${CUSTOM_ALGO:-}"
-GPU_STATS_FILE=/run/hive/gpu-stats.json
+BIN_PATH="$SCRIPT_DIR/gpu"
 
 json_escape() {
   local str=${1-}
@@ -35,19 +35,89 @@ array_to_json_numbers() {
   fi
 }
 
+should_skip_bus_id() {
+  local id=${1,,}
+  if [[ $id =~ ^([0-9a-f]{4}|[0-9a-f]{8}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])$ ]]; then
+    local bus=${BASH_REMATCH[2]}
+    local func=${BASH_REMATCH[4]}
+    if [[ $bus == "00" ]] && [[ $func == "0" ]]; then
+      return 0
+    fi
+  elif [[ $id =~ ^([0-9a-f]{2}):([0-9a-f]{1,2})\.([0-7])$ ]]; then
+    local bus=${BASH_REMATCH[1]}
+    local func=${BASH_REMATCH[3]}
+    if [[ $bus == "00" ]] && [[ $func == "0" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+get_proc_uptime() {
+  if [[ ! -x $BIN_PATH ]]; then
+    return 1
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 1
+  fi
+
+  mapfile -t pids < <(pgrep -f "$BIN_PATH" 2>/dev/null || true)
+  for pid in "${pids[@]}"; do
+    [[ -z $pid ]] && continue
+    etimes=$(ps -p "$pid" -o etimes= 2>/dev/null | awk 'NR==1 { gsub(/^[ \t]+/, ""); print }')
+    if [[ $etimes =~ ^[0-9]+$ ]]; then
+      echo "$etimes"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 declare -a temp_arr fan_arr busids_hex bus_arr
-if command -v jq >/dev/null 2>&1 && [[ -f $GPU_STATS_FILE ]]; then
-  mapfile -t temp_arr   < <(jq -r '.temp[]? | tonumber' "$GPU_STATS_FILE")
-  mapfile -t fan_arr    < <(jq -r '.fan[]? | tonumber' "$GPU_STATS_FILE")
-  mapfile -t busids_hex < <(jq -r '.busids[]?' "$GPU_STATS_FILE")
+declare -A skip_idx
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  while IFS=, read -r idx temp fan busid; do
+    idx=${idx//[[:space:]]/}
+    [[ -z $idx ]] && continue
+
+    temp=${temp//[[:space:]]/}
+    if [[ ! $temp =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      temp=0
+    fi
+    temp=${temp%%.*}
+
+    fan=${fan//[[:space:]]/}
+    if [[ ! $fan =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      fan=0
+    fi
+    fan=${fan%%.*}
+
+    busid=${busid//[[:space:]]/}
+    [[ -z $busid ]] && busid="0000:00:00.0"
+
+    temp_arr[idx]=$temp
+    fan_arr[idx]=$fan
+    busids_hex[idx]=${busid,,}
+  done < <(nvidia-smi --query-gpu=index,temperature.gpu,fan.speed,pci.bus_id --format=csv,noheader,nounits 2>/dev/null || true)
 fi
 
-for id in "${busids_hex[@]}"; do
+for idx in "${!busids_hex[@]}"; do
+  id=${busids_hex[idx]}
+  if should_skip_bus_id "$id"; then
+    skip_idx[$idx]=1
+  fi
   bus_part=${id%%:*}
+  if [[ $id =~ ^([0-9a-fA-F]{4}|[0-9a-fA-F]{8}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.[0-7]$ ]]; then
+    bus_part=${BASH_REMATCH[2]}
+  elif [[ $id =~ ^([0-9a-fA-F]{2}):([0-9a-fA-F]{1,2})\.[0-7]$ ]]; then
+    bus_part=${BASH_REMATCH[1]}
+  fi
   if [[ $bus_part =~ ^[0-9a-fA-F]+$ ]]; then
-    bus_arr+=( $((16#$bus_part)) )
+    bus_arr[$idx]=$((16#$bus_part))
   else
-    bus_arr+=(0)
+    bus_arr[$idx]=0
   fi
 done
 
@@ -79,18 +149,24 @@ done
 
 hs_arr=()
 shares_arr=()
+temp_out=()
+fan_out=()
+bus_out=()
 for ((i=0; i<count; i++)); do
+  if [[ -n ${skip_idx[$i]:-} ]]; then
+    continue
+  fi
   value=${hs_map[$i]:-0}
   if [[ $value == 0 ]]; then
     kh=0
   else
     kh=$(awk -v v="$value" 'BEGIN { printf "%.3f", v/1000 }')
   fi
-  hs_arr[i]=$kh
-  shares_arr[i]=${acc_map[$i]:-0}
-  (( i >= ${#temp_arr[@]} )) && temp_arr[i]=0
-  (( i >= ${#fan_arr[@]} )) && fan_arr[i]=0
-  (( i >= ${#bus_arr[@]} )) && bus_arr[i]=0
+  hs_arr+=("$kh")
+  shares_arr+=("${acc_map[$i]:-0}")
+  temp_out+=("${temp_arr[i]:-0}")
+  fan_out+=("${fan_arr[i]:-0}")
+  bus_out+=("${bus_arr[i]:-0}")
 done
 
 sum_khs=0
@@ -103,7 +179,9 @@ for val in "${shares_arr[@]}"; do
   accepted_total=$(( accepted_total + val ))
 done
 
-if [[ -f $LOG_FILE ]]; then
+if uptime=$(get_proc_uptime); then
+  :
+elif [[ -f $LOG_FILE ]]; then
   now=$(date +%s)
   file_mtime=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
   (( uptime = now - file_mtime ))
@@ -113,9 +191,9 @@ else
 fi
 
 hs_json=$(array_to_json_numbers hs_arr)
-temp_json=$(array_to_json_numbers temp_arr)
-fan_json=$(array_to_json_numbers fan_arr)
-bus_json=$(array_to_json_numbers bus_arr)
+temp_json=$(array_to_json_numbers temp_out)
+fan_json=$(array_to_json_numbers fan_out)
+bus_json=$(array_to_json_numbers bus_out)
 if command -v jq >/dev/null 2>&1; then
   stats=$(jq -nc \
     --argjson hs "$hs_json" \
