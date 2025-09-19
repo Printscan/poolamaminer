@@ -10,6 +10,7 @@ LOG_FILE="${CUSTOM_LOG_BASENAME}.log"
 VERSION_VALUE="${CUSTOM_VERSION:-}"
 ALGO_VALUE="${CUSTOM_ALGO:-}"
 BIN_PATH="$SCRIPT_DIR/gpu"
+IGNORE_PCI_BUS_00=${IGNORE_PCI_BUS_00:-1}
 
 json_escape() {
   local str=${1-}
@@ -23,10 +24,12 @@ json_escape() {
 
 array_to_json_numbers() {
   local -n arr_ref=$1
+  local default=${2:-0}
   local output="["
   local val
   for val in "${arr_ref[@]}"; do
-    output+="${val:-0},"
+    [[ -z $val ]] && val=$default
+    output+="${val},"
   done
   if [[ $output == "[" ]]; then
     printf '[]'
@@ -75,6 +78,10 @@ get_proc_uptime() {
 }
 
 declare -a temp_arr fan_arr busids_hex bus_arr
+temp_arr=()
+fan_arr=()
+busids_hex=()
+bus_arr=()
 declare -A skip_idx
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -103,9 +110,10 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   done < <(nvidia-smi --query-gpu=index,temperature.gpu,fan.speed,pci.bus_id --format=csv,noheader,nounits 2>/dev/null || true)
 fi
 
+all_bus_zero=true
 for idx in "${!busids_hex[@]}"; do
   id=${busids_hex[idx]}
-  if should_skip_bus_id "$id"; then
+  if (( IGNORE_PCI_BUS_00 != 0 )) && should_skip_bus_id "$id"; then
     skip_idx[$idx]=1
   fi
   bus_part=${id%%:*}
@@ -116,10 +124,17 @@ for idx in "${!busids_hex[@]}"; do
   fi
   if [[ $bus_part =~ ^[0-9a-fA-F]+$ ]]; then
     bus_arr[$idx]=$((16#$bus_part))
+    if (( bus_arr[$idx] != 0 )); then
+      all_bus_zero=false
+    fi
   else
     bus_arr[$idx]=0
   fi
 done
+
+if $all_bus_zero; then
+  skip_idx=()
+fi
 
 declare -A hs_map acc_map
 if [[ -f $LOG_FILE ]]; then
@@ -147,6 +162,7 @@ for idx in "${seen[@]}"; do
   (( idx + 1 > count )) && count=$((idx + 1))
 done
 
+declare -a hs_arr shares_arr temp_out fan_out bus_out
 hs_arr=()
 shares_arr=()
 temp_out=()
@@ -190,10 +206,10 @@ else
   uptime=0
 fi
 
-hs_json=$(array_to_json_numbers hs_arr)
-temp_json=$(array_to_json_numbers temp_out)
-fan_json=$(array_to_json_numbers fan_out)
-bus_json=$(array_to_json_numbers bus_out)
+hs_json=$(array_to_json_numbers hs_arr 0)
+temp_json=$(array_to_json_numbers temp_out 0)
+fan_json=$(array_to_json_numbers fan_out 0)
+bus_json=$(array_to_json_numbers bus_out 0)
 if command -v jq >/dev/null 2>&1; then
   stats=$(jq -nc \
     --argjson hs "$hs_json" \
