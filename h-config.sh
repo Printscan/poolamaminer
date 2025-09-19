@@ -69,6 +69,7 @@ if [[ -z "$secret" ]]; then
 fi
 
 extra_args="${CUSTOM_USER_CONFIG:-}"
+extra_programs=()
 
 if [[ -n "$extra_args" ]]; then
   eval "set -- $extra_args"
@@ -86,6 +87,16 @@ if [[ -n "$extra_args" ]]; then
       WALLET=*|wallet=*)
         wallet=${token#*=}
         ;;
+      RUN=*|run=*)
+        value=${token#*=}
+        value=${value%%[[:space:]]*}
+        [[ -n "$value" ]] && extra_programs+=("$value")
+        ;;
+      RUN:*|run:*)
+        value=${token#*:}
+        value=${value%%[[:space:]]*}
+        [[ -n "$value" ]] && extra_programs+=("$value")
+        ;;
       *)
         remaining+=("$token")
         ;;
@@ -94,12 +105,19 @@ if [[ -n "$extra_args" ]]; then
   extra_args="${remaining[*]:-}"
 fi
 
+if ((${#extra_programs[@]})); then
+  extra_programs_serialized=$(printf '%s\n' "${extra_programs[@]}")
+else
+  extra_programs_serialized=""
+fi
+
 mkdir -p "$(dirname "$CUSTOM_CONFIG_FILENAME")"
 cat > "$CUSTOM_CONFIG_FILENAME" <<CFG
 RIG=$(printf '%q' "$rig_name")
 SECRET=$(printf '%q' "$secret")
 WALLET=$(printf '%q' "$wallet")
 EXTRA_ARGS=$(printf '%q' "$extra_args")
+EXTRA_PROGRAMS=$(printf '%q' "$extra_programs_serialized")
 CFG
 
 chmod 600 "$CUSTOM_CONFIG_FILENAME"
